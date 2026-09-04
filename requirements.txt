@@ -1,0 +1,7 @@
+# GCAD - Git for CAD
+#
+# To build a standalone Windows .exe:
+#   pip install pyinstaller ttkbootstrap
+#   pyinstaller build.spec
+
+ttkbootstrap>=1.10.0
