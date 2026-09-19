@@ -2,6 +2,10 @@ import subprocess
 import json
 import os
 import re
+import threading
+import time
+from contextvars import copy_context
+from progress import report, is_reporting
 
 
 class GitError(Exception):
@@ -20,16 +24,26 @@ def _subprocess_kwargs():
 
 
 def _run_git(args, repo_path=None, timeout=120):
-    cmd = ['git', '-c', 'http.sslVerify=false'] + args
+    transfer = args and args[0] in ('clone', 'pull', 'push', 'fetch') and is_reporting()
+    if transfer:
+        args = [args[0], '--progress'] + args[1:]
+    cmd = ['git'] + args
     env = dict(os.environ)
+    # The windowed executable has no terminal; credential helpers can still
+    # open their browser/UI for HTTPS sign-in.
+    env['GIT_TERMINAL_PROMPT'] = '0'
+    # All GCAD Git/LFS operations use this override, including existing repos.
+    # Keep it in child processes so Git settings outside GCAD are unaffected.
     env['GIT_SSL_NO_VERIFY'] = 'true'
     try:
-        result = subprocess.run(
+        runner = _run_transfer if transfer else subprocess.run
+        result = runner(
             cmd,
             capture_output=True,
             stdin=subprocess.DEVNULL,
             text=True,
             encoding='utf-8',
+            errors='replace',
             cwd=repo_path,
             timeout=timeout,
             env=env,
@@ -49,6 +63,43 @@ def _run_git(args, repo_path=None, timeout=120):
         raise GitError(result.stderr.strip() or result.stdout.strip())
 
     return result.stdout.rstrip('\n')
+
+
+def _run_transfer(cmd, timeout, **kwargs):
+    """Drain both pipes while Git runs, retaining output for normal error handling."""
+    kwargs.pop('capture_output')
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+    output, errors = [], []
+
+    def read_stdout():
+        output.append(process.stdout.read())
+        process.stdout.close()
+
+    def read_stderr():
+        last = 0
+        for line in process.stderr:
+            errors.append(line)
+            # Git percentages describe individual transfer stages, not an ETA.
+            if '%' in line and time.monotonic() - last >= 0.2:
+                report(line.strip())
+                last = time.monotonic()
+        process.stderr.close()
+
+    context = copy_context()
+    readers = [threading.Thread(target=read_stdout, daemon=True),
+               threading.Thread(target=lambda: context.run(read_stderr), daemon=True)]
+    for reader in readers:
+        reader.start()
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=1)
+    return subprocess.CompletedProcess(cmd, process.returncode, ''.join(output), ''.join(errors))
 
 
 def _run_git_lfs(args, repo_path=None, timeout=120):
@@ -71,18 +122,24 @@ def check_git_lfs():
         return False, str(e)
 
 
-def clone_repo(url, local_path):
+def clone_repo(url, local_path, ssh_command=None):
+    report('Downloading the repository. Complete Git’s sign-in window if prompted.')
     parent = os.path.dirname(local_path)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
-    _run_git(['clone', url, local_path], timeout=600)
-    _run_git_lfs(['install'], repo_path=local_path, timeout=30)
+    options = ['--config', 'core.sshCommand=' + ssh_command] if ssh_command else []
+    _run_git(['clone'] + options + ['--', url, local_path], timeout=600)
+    report('Repository downloaded. Preparing large CAD files…')
+    _run_git_lfs(['install', '--local'], repo_path=local_path, timeout=30)
     _run_git_lfs(['pull'], repo_path=local_path, timeout=300)
 
 
 def pull_repo(repo_path):
+    report('Syncing commits from the remote and reapplying your local changes…')
     _run_git(['pull', '--rebase', '--autostash'], repo_path=repo_path, timeout=300)
+    report('Downloading large CAD files with Git LFS…')
     _run_git_lfs(['pull'], repo_path=repo_path, timeout=300)
+    report('Download complete. Checking the updated repository…')
 
 
 def get_current_branch(repo_path):
@@ -107,8 +164,10 @@ def get_repo_name(repo_path):
 
 
 def get_file_statuses(repo_path):
+    report('Checking who has files locked on the server…')
     locks_ours = {}
     locks_theirs = {}
+    locks_verified = True
     try:
         raw = _run_git_lfs(['locks', '--verify', '--json'], repo_path=repo_path)
         if raw:
@@ -121,13 +180,16 @@ def get_file_statuses(repo_path):
                 path = lock['path'].replace('\\', '/')
                 owner = lock.get('owner', {}).get('name', 'Unknown')
                 locks_theirs[path] = owner
-    except (GitError, json.JSONDecodeError):
-        pass
+    except (GitError, json.JSONDecodeError) as exc:
+        locks_verified = False
+        report('Lock information is unavailable; ownership has not been verified. ' + str(exc), level='warning')
 
+    report('Scanning local files for changes, additions, and deletions…')
     modified = set()
     deleted = set()
     untracked = set()
     conflicted = set()
+    renamed_sources = set()
     try:
         # Git normally condenses a wholly untracked directory into one entry
         # (for example, ``?? designs/new-part/``).  The UI displays files in
@@ -136,18 +198,25 @@ def get_file_statuses(repo_path):
         # file so new folders and their contents build the same tree as
         # tracked folders.
         raw = _run_git(
-            ['status', '--porcelain', '--untracked-files=all'],
+            ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
             repo_path=repo_path,
         )
-        for line in raw.splitlines():
-            line = line.rstrip()
-            if not line:
+        # NUL-separated records preserve literal names, including spaces and
+        # Unicode. The line format quotes/escapes paths, creating duplicate
+        # entries when those strings are combined with the LFS inventory.
+        records = iter(raw.split('\0'))
+        for record in records:
+            if not record:
                 continue
-            flags = line[:2]
-            path = line[3:]
-            if ' -> ' in path:
-                path = path.split(' -> ')[-1]
+            flags = record[:2]
+            path = record[3:]
             path = path.replace('\\', '/')
+            # In -z format a rename/copy has destination first, then a
+            # separate source record without status flags.
+            if 'R' in flags or 'C' in flags:
+                source = next(records).replace('\\', '/')
+                if 'R' in flags:
+                    renamed_sources.add(source)
             if 'U' in flags:
                 conflicted.add(path)
             if 'D' in flags:
@@ -157,17 +226,23 @@ def get_file_statuses(repo_path):
             if flags == '??':
                 untracked.add(path)
     except GitError:
-        pass
+        # A failed local scan must not look like a clean repository.
+        raise
 
+    report('Reading the large-file inventory…')
     lfs_files = set()
     try:
-        raw = _run_git_lfs(['ls-files', '--name-only'], repo_path=repo_path)
-        for line in raw.splitlines():
-            line = line.strip()
-            if line:
-                lfs_files.add(line.replace('\\', '/'))
+        # LFS also reads Git's diff output for staged changes. Disable Git's
+        # Unicode quoting there so the JSON names match the status paths.
+        raw = _run_git(['-c', 'core.quotepath=false', 'lfs', 'ls-files', '--json'],
+                       repo_path=repo_path)
+        for file in json.loads(raw).get('files') or []:
+            lfs_files.add(file['name'].replace('\\', '/'))
     except GitError:
-        pass
+        raise
+
+    # LFS can still list the HEAD path after a staged rename.
+    lfs_files.difference_update(renamed_sources)
 
     all_paths = set()
     all_paths.update(lfs_files)
@@ -221,6 +296,7 @@ def get_file_statuses(repo_path):
             'status': status,
             'locked_by': lock_owner,
             'is_lfs': is_lfs,
+            'locks_verified': locks_verified,
         })
 
     return result
@@ -229,44 +305,55 @@ def get_file_statuses(repo_path):
 def lock_files(repo_path, file_paths):
     if not file_paths:
         return
-    for fp in file_paths:
+    for index, fp in enumerate(file_paths):
+        report('Locking: ' + fp, index, len(file_paths))
         _run_git_lfs(['lock', fp], repo_path=repo_path, timeout=60)
+        report('Locked: ' + fp, index + 1, len(file_paths))
 
 
 def unlock_files(repo_path, file_paths, force=False):
     if not file_paths:
         return
-    for fp in file_paths:
+    for index, fp in enumerate(file_paths):
+        report('Unlocking: ' + fp, index, len(file_paths))
         args = ['unlock', '--force', fp] if force else ['unlock', fp]
         _run_git_lfs(args, repo_path=repo_path, timeout=60)
+        report('Unlocked: ' + fp, index + 1, len(file_paths))
 
 
 def restore_files(repo_path, file_paths):
     if not file_paths:
         return
-    for fp in file_paths:
+    for index, fp in enumerate(file_paths):
+        report('Restoring: ' + fp, index, len(file_paths))
         _run_git(['restore', fp], repo_path=repo_path, timeout=60)
+        report('Restored: ' + fp, index + 1, len(file_paths))
 
 
 def install_lfs(repo_path):
+    report('Preparing Git LFS for this repository…')
     try:
-        _run_git_lfs(['install'], repo_path=repo_path, timeout=30)
-    except GitError:
-        pass
+        _run_git_lfs(['install', '--local'], repo_path=repo_path, timeout=30)
+    except GitError as exc:
+        report('Git LFS initialization needs attention: ' + str(exc), level='warning')
 
 
 def checkout_branch(repo_path, branch):
+    report('Switching to branch ' + branch + '…')
     _run_git(['checkout', branch], repo_path=repo_path, timeout=60)
 
 
 def hard_reset_repo(repo_path):
+    report('Checking the current branch…')
     branch = get_current_branch(repo_path)
     if branch == 'HEAD':
         raise GitError(
             "Cannot hard reset: repository is in a detached HEAD state.\n\n"
             "Open File > Settings and set the correct branch, then try again."
         )
+    report('Fetching the latest remote commits…')
     _run_git(['fetch', 'origin'], repo_path=repo_path, timeout=120)
+    report('Replacing local changes with origin/' + branch + '…')
     _run_git(['reset', '--hard', 'origin/' + branch], repo_path=repo_path, timeout=60)
 
 
@@ -311,7 +398,8 @@ def _stage_deletions(repo_path, rm_paths):
         _run_git(['rm', '-f', '--'] + tracked, repo_path=repo_path, timeout=60)
 
 
-def commit_and_push(repo_path, file_paths, message, deleted_paths=None):
+def commit_and_push(repo_path, file_paths, message, deleted_paths=None, unlock_paths=None):
+    report('Preparing the selected changes for a commit…')
     if not file_paths:
         _restore_autostash(repo_path)
         _run_git(['add', '-A'], repo_path=repo_path, timeout=60)
@@ -346,11 +434,14 @@ def commit_and_push(repo_path, file_paths, message, deleted_paths=None):
             "The selected changes are already up to date on the remote."
         )
 
+    report('Creating your commit…')
     _run_git(['commit', '-m', message], repo_path=repo_path, timeout=60)
 
     try:
+        report('Uploading commits and large CAD files to the remote…')
         _run_git(['push'], repo_path=repo_path, timeout=300)
     except GitError as e:
+        report('Upload failed. Rolling back the local commit…', level='warning')
         try:
             _run_git(['reset', 'HEAD~1'], repo_path=repo_path, timeout=30)
         except GitError:
@@ -361,11 +452,15 @@ def commit_and_push(repo_path, file_paths, message, deleted_paths=None):
             "Details: " + str(e)
         )
 
-    for fp in file_paths:
+    report('Push succeeded. Releasing locks on the pushed files…')
+    unlock_paths = file_paths if unlock_paths is None else unlock_paths
+    for index, fp in enumerate(unlock_paths):
+        report('Releasing lock: ' + fp, index, len(unlock_paths))
         try:
             _run_git_lfs(['unlock', fp], repo_path=repo_path, timeout=30)
-        except GitError:
-            pass
+        except GitError as exc:
+            report('Changes were pushed, but no lock was released for {}: {}'.format(fp, exc), level='warning')
+        report('Checked lock: ' + fp, index + 1, len(unlock_paths))
 
 
 

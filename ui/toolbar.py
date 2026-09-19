@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk
+import ttkbootstrap as ttk
 
 from dpi import s
 
@@ -10,25 +10,31 @@ class Toolbar(ttk.Frame):
         self.buttons = {}
         self._create_widgets()
 
-    def _add_button(self, key, text, command=None, width=14):
-        btn = ttk.Button(self, text=text, command=command, width=width)
+    def _add_button(self, key, text, command=None, width=14, style='secondary-outline'):
+        btn = ttk.Button(self._button_row, text=text, command=command, width=width, bootstyle=style, padding=(s(8), s(3)))
         btn.pack(side='left', padx=s(2), pady=s(2))
         self.buttons[key] = btn
         return btn
 
     def _add_separator(self):
-        sep = ttk.Separator(self, orient='vertical')
+        sep = ttk.Separator(self._button_row, orient='vertical')
         sep.pack(side='left', fill='y', padx=s(6), pady=s(4))
 
     def _create_widgets(self):
-        self._add_button('refresh', 'Refresh', width=10)
-        self._add_separator()
-        self._add_button('pull', 'Pull', width=10)
-        self._add_button('commit_push', 'Push', width=10)
-        self._add_button('restore', 'Restore', width=10)
+        self._button_row = ttk.Frame(self)
+        self._button_row.pack(fill='x')
+        self._add_button('pull', 'Pull latest', width=11, style='primary-outline')
+        self._add_button('refresh', 'Refresh', width=9)
         self._add_separator()
         self._add_button('lock', 'Lock', width=8)
         self._add_button('unlock', 'Unlock', width=8)
+        self._add_button('commit_push', 'Push changes', width=13, style='primary')
+        self._add_separator()
+        self._add_button('restore', 'Restore', width=9, style='danger-outline')
+        self._button_row = ttk.Frame(self)
+        self._button_row.pack(fill='x')
+        self._add_button('open_file', 'Open file', width=11, style='secondary-link')
+        self._add_button('open_folder', 'Open containing folder', width=23, style='secondary-link')
 
     def set_command(self, key, command):
         if key in self.buttons:

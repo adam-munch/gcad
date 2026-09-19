@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import filedialog
+import ttkbootstrap as ttk
 import os
 import sys
 import queue
@@ -8,7 +9,8 @@ import threading
 import ttkbootstrap as tb
 
 from dpi import s
-from config import DEFAULT_CONFIG, load_config, save_config, config_exists
+from config import load_config, save_config
+from setup_ops import refresh_tool_path
 from git_ops import (
     check_git, check_git_lfs, pull_repo, get_file_statuses,
     lock_files, unlock_files, commit_and_push, restore_files,
@@ -18,59 +20,58 @@ from git_ops import (
 )
 from ui.file_table import FileTable
 from ui.toolbar import Toolbar
+from ui.activity import ActivityPanel
+from ui.theme import ThemeManager, THEME_OPTIONS
+from progress import operation_progress, report
 from ui.dialogs import SetupWizard, CommitDialog, show_error, show_info, show_confirm, _raise_on_top
 
 
 class App:
-    def __init__(self, theme='flatly'):
-        self.root = tb.Window(themename=theme)
+    def __init__(self, theme=None):
+        if sys.platform == 'win32':
+            # Give source and packaged launches their own Windows taskbar group.
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('MMR.GCAD')
+        self.root = tb.Window(themename='flatly')
+        self._set_app_icon()
+        saved = load_config() or {}
+        self.theme = ThemeManager(self.root, theme or saved.get('theme', 'system'))
         self.root.title('GCAD - Git for CAD')
-        self.root.geometry('{}x{}'.format(s(900), s(600)))
-        self.root.minsize(s(700), s(400))
+        self.root.geometry('{}x{}+{}+{}'.format(
+            min(s(1100), self.root.winfo_screenwidth() - s(60)),
+            min(s(800), self.root.winfo_screenheight() - s(100)), s(20), s(10)))
+        self.root.minsize(s(900), s(700))
 
         self.config = None
         self._busy = False
+        self._status_text = 'Ready'
         self._op_queue = queue.Queue()
 
     def _start(self):
-        git_ok, git_msg = check_git()
-        if not git_ok:
-            self._abort_startup('Git Not Found', git_msg)
-            return
-
-        lfs_ok, lfs_msg = check_git_lfs()
-        if not lfs_ok:
-            self._abort_startup('Git LFS Not Found', lfs_msg)
-            return
-
-        missing_repository = False
-        if config_exists():
-            self.config = load_config()
-            if self.config and self.config.get('local_path'):
-                repo_path = self.config['local_path']
-                if not self._is_repo_path(repo_path):
-                    # Do not leave the stale path in the config.  Open the
-                    # normal New Repository flow after the main window loads.
-                    self.config = dict(DEFAULT_CONFIG)
-                    save_config(self.config)
-                    missing_repository = True
-
-        if (not missing_repository
-                and (not self.config or not self.config.get('local_path'))):
+        self.config = load_config()
+        if not self.config or not self._is_repo_path(self.config.get('local_path')):
+            # First launch, deleted/corrupt configuration, or a moved repository.
+            # The wizard must open before checking prerequisites: it installs them.
+            self.config = None
             self.root.deiconify()
             SetupWizard(self.root, self._on_setup_complete)
-            if not self.config or not self.config.get('local_path'):
+            if not self.config:
                 self.root.destroy()
+                return
+        else:
+            refresh_tool_path()
+            git_ok, git_msg = check_git()
+            if not git_ok:
+                self._abort_startup('Git Not Found', git_msg)
+                return
+            lfs_ok, lfs_msg = check_git_lfs()
+            if not lfs_ok:
+                self._abort_startup('Git LFS Not Found', lfs_msg)
                 return
 
         self._build_ui()
-        self._set_app_icon()
         self.root.deiconify()
         self.root.after(100, self._process_queue)
-        if missing_repository:
-            self._set_status('Select a repository to get started.')
-            self.root.after_idle(self._on_clone_repo)
-            return
         self._refresh()
         self.root.after(500, self._initial_pull)
 
@@ -99,8 +100,9 @@ class App:
         return os.path.isdir(git_dir) or os.path.isfile(git_dir)
 
     def _on_setup_complete(self, config):
+        config = dict(config, theme=self.theme.preference)
+        save_config(config)
         self.config = config
-        save_config(self.config)
 
     def _on_clone_repo(self):
         if self._busy:
@@ -108,8 +110,9 @@ class App:
         SetupWizard(self.root, self._on_clone_complete, allow_skip=False)
 
     def _on_clone_complete(self, config):
+        config = dict(config, theme=self.theme.preference)
+        save_config(config)
         self.config = config
-        save_config(self.config)
         self._set_status('Switched to repository: {}'.format(
             os.path.basename(config.get('local_path', ''))))
         self._refresh()
@@ -124,15 +127,48 @@ class App:
         file_menu.add_separator()
         file_menu.add_command(label='Hard Reset...', command=self._on_hard_reset)
         file_menu.add_separator()
-        file_menu.add_command(label='Exit', command=self.root.quit)
+        file_menu.add_command(label='Exit', command=self._on_close)
+        self.file_menu = file_menu
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         menubar.add_cascade(label='File', menu=file_menu)
 
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label='About GCAD', command=self._show_about)
         menubar.add_cascade(label='Help', menu=help_menu)
 
+        header = ttk.Frame(self.root, padding=(s(16), s(8)))
+        header.pack(fill='x')
+        header.columnconfigure(0, weight=1)
+        self.branch_label = ttk.Label(header, text='Loading repository…', font=('Segoe UI', 12, 'bold'))
+        self.branch_label.grid(row=0, column=0, sticky='ew', padx=(0, s(12)))
+        self.repo_label = ttk.Label(header, text=self._repo_path(), bootstyle='secondary', anchor='w')
+        self.repo_label.grid(row=1, column=0, sticky='ew', padx=(0, s(12)))
+        appearance = ttk.Frame(header)
+        appearance.grid(row=0, column=1, rowspan=2, sticky='e')
+        ttk.Label(appearance, text='Appearance', bootstyle='secondary').pack(side='left', padx=(0, s(6)))
+        self.theme_var = tk.StringVar(value=next(label for label, value in THEME_OPTIONS.items()
+                                               if value == self.theme.preference))
+        self.theme_picker = ttk.Combobox(appearance, textvariable=self.theme_var,
+                                        values=list(THEME_OPTIONS), state='readonly', width=14)
+        self.theme_picker.pack(side='left')
+        self.theme_picker.bind('<<ComboboxSelected>>', self._change_theme)
+
+        summary = ttk.Frame(self.root)
+        summary.pack(fill='x', padx=s(16), pady=(0, s(6)))
+        self.summary_labels = {}
+        for column, (key, label, color) in enumerate((('total', 'FILES', 'primary'),
+                ('changed', 'CHANGED', 'warning'), ('mine', 'LOCKED BY YOU', 'info'),
+                ('others', 'LOCKED BY TEAM', 'danger'))):
+            card = ttk.Frame(summary, padding=(s(10), s(4)), style='Card.TFrame')
+            card.grid(row=0, column=column, sticky='ew', padx=(0 if column == 0 else s(6), 0))
+            summary.columnconfigure(column, weight=1, uniform='cards')
+            ttk.Label(card, text=label, font=('Segoe UI', 9, 'bold'), style='Muted.Card.TLabel').pack(side='left')
+            value = ttk.Label(card, text='—', style=color + '.Metric.TLabel')
+            value.pack(side='right', padx=(s(8), 0))
+            self.summary_labels[key] = value
+
         self.toolbar = Toolbar(self.root)
-        self.toolbar.pack(fill='x', padx=s(5), pady=(s(5), 0))
+        self.toolbar.pack(fill='x', padx=s(14), pady=(0, s(4)))
 
         self.toolbar.set_command('refresh', self._on_refresh)
         self.toolbar.set_command('pull', self._on_pull)
@@ -140,37 +176,77 @@ class App:
         self.toolbar.set_command('restore', self._on_restore)
         self.toolbar.set_command('lock', self._on_lock)
         self.toolbar.set_command('unlock', self._on_unlock)
+        self.toolbar.set_command('open_file', self._on_open_file)
+        self.toolbar.set_command('open_folder', self._on_open_folder)
 
-        self.file_table = FileTable(self.root)
-        self.file_table.pack(fill='both', expand=True, padx=s(5), pady=s(5))
+        # Pack feedback first so it remains visible when the file area shrinks.
+        self.activity = ActivityPanel(self.root)
+        self.activity.pack(side='bottom', fill='x', padx=s(16), pady=(s(6), s(8)))
 
-        status_frame = ttk.Frame(self.root)
-        status_frame.pack(fill='x', padx=s(5), pady=(0, s(5)))
+        files_header = ttk.Frame(self.root)
+        files_header.pack(fill='x', padx=s(16), pady=(0, s(4)))
+        ttk.Label(files_header, text='Repository files', font=('Segoe UI', 10, 'bold')).pack(side='left')
+        self.selection_label = ttk.Label(files_header, text='Select files or folders to get started', bootstyle='secondary')
+        self.selection_label.pack(side='right')
+        self.file_table = FileTable(self.root, on_file_select=self._selection_changed)
+        self.file_table.pack(fill='both', expand=True, padx=s(16))
 
-        self.status_label = ttk.Label(status_frame, text='Ready')
-        self.status_label.pack(side='left')
+        self._selection_changed([])
 
-        self.branch_label = ttk.Label(status_frame, text='')
-        self.branch_label.pack(side='right')
+    def _change_theme(self, event=None):
+        preference = THEME_OPTIONS[self.theme_var.get()]
+        settings = dict(self.config, theme=preference)
+        try:
+            save_config(settings)
+        except OSError as exc:
+            self.theme_var.set(next(label for label, value in THEME_OPTIONS.items()
+                                    if value == self.theme.preference))
+            show_error('Appearance could not be saved', str(exc), parent=self.root)
+            return
+        self.config = settings
+        self.theme.set_preference(preference)
 
-    def _update_title(self):
-        repo_path = self.config.get('local_path', '')
-        if self._is_repo_path(repo_path):
-            try:
-                branch = get_current_branch(repo_path)
-                name = get_repo_name(repo_path)
-                if branch == 'HEAD':
-                    disp = '(detached)'
-                else:
-                    disp = branch
-                self.root.title('GCAD - {} [{}]'.format(name, disp))
-                self.branch_label.config(text='Branch: {}'.format(disp))
-            except GitError:
-                self.root.title('GCAD')
-                self.branch_label.config(text='')
-        else:
-            self.root.title('GCAD')
-            self.branch_label.config(text='')
+    def _selection_changed(self, selected):
+        count = len(selected)
+        self.selection_label.configure(text='{} file{} selected'.format(count, '' if count == 1 else 's')
+                                       if count else 'Select files or folders to get started')
+        if not self._busy:
+            for key in ('lock', 'unlock', 'commit_push', 'restore'):
+                self.toolbar.set_enabled(key, bool(count))
+            self.toolbar.set_enabled('open_file', count == 1 and selected[0]['status'] != 'deleted')
+            self.toolbar.set_enabled('open_folder', count == 1)
+
+    def _populate(self, statuses):
+        self.file_table.populate(statuses)
+        counts = dict(total=len(statuses),
+                      changed=sum(f['status'] not in ('unchanged', 'locked_by_me', 'locked_by_other') for f in statuses),
+                      mine=sum(f['status'].startswith('locked_by_me') for f in statuses),
+                      others=sum(f['status'].startswith('locked_by_other') for f in statuses))
+        for key, value in counts.items():
+            if key in ('mine', 'others') and any(not f.get('locks_verified', True) for f in statuses):
+                value = '—'
+            self.summary_labels[key].configure(text=str(value))
+        self._selection_changed(self.file_table.get_selected_files())
+
+    def _on_close(self):
+        if self._busy:
+            self.activity.hint.configure(text='Please wait for this operation to finish before closing GCAD.')
+            self.root.bell()
+            return
+        self.root.destroy()
+
+    def _read_repo_title(self):
+        """Read Git metadata on the worker, along with the file status scan."""
+        repo_path = self._repo_path()
+        branch = get_current_branch(repo_path)
+        return get_repo_name(repo_path), '(detached)' if branch == 'HEAD' else branch
+
+    def _update_title(self, metadata=None):
+        if metadata:
+            name, branch = metadata
+            self.root.title('GCAD - {} [{}]'.format(name, branch))
+            self.branch_label.configure(text='{}  /  {}'.format(name, branch))
+            self.repo_label.configure(text=self._repo_path())
 
     def _process_queue(self):
         try:
@@ -184,45 +260,71 @@ class App:
     def _enqueue(self, fn):
         self._op_queue.put(fn)
 
-    def _async(self, fn, on_done=None, on_error=None):
-        def wrapper():
+    def _async(self, fn, on_done=None, on_error=None, title='Refreshing files'):
+        if self._busy:
+            return
+        def progress(message, completed=None, total=None, level='info'):
+            self._enqueue(lambda: self.activity.update_progress(message, completed, total, level))
+
+        def finish(result, metadata, error):
             try:
-                result = fn()
-                if on_done:
-                    self._enqueue(lambda r=result: on_done(r))
-            except GitError as e:
-                err = str(e)
-                if on_error:
-                    self._enqueue(lambda e=e: on_error(e))
+                if error is not None:
+                    self.activity.finish(str(error) + '\nEarlier steps may have completed. Refresh to check the current file state.', error=True)
+                    if on_error:
+                        on_error(error)
                 else:
-                    self._enqueue(lambda m=err: show_error('Error', m))
-            except Exception as e:
-                err = str(e)
-                if on_error:
-                    self._enqueue(lambda e=e: on_error(e))
-                else:
-                    self._enqueue(lambda m=err: show_error('Unexpected Error', m))
+                    self._update_title(metadata)
+                    if on_done:
+                        on_done(result)
+                    self.activity.finish(self._status_text)
+            except Exception as exc:
+                self.activity.finish('Could not update the display. Try Refresh.\n' + str(exc), error=True)
             finally:
-                self._enqueue(lambda: self._set_busy(False))
+                self._set_busy(False)
+
+        def wrapper():
+            result, metadata, error = None, None, None
+            try:
+                with operation_progress(progress):
+                    result = fn()
+                    try:
+                        metadata = self._read_repo_title()
+                    except GitError as exc:
+                        report('Could not read repository details: ' + str(exc), level='warning')
+            except Exception as exc:
+                error = exc
+            finally:
+                self._enqueue(lambda: finish(result, metadata, error))
 
         self._set_busy(True)
+        self._status_text = 'Operation completed.'
+        self.activity.begin(title)
         t = threading.Thread(target=wrapper, daemon=True)
         t.start()
 
     def _set_busy(self, busy):
         self._busy = busy
+        self.theme_picker.configure(state='disabled' if busy else 'readonly')
         if busy:
             self.toolbar.set_all_enabled(False)
         else:
             self.toolbar.enable_defaults()
+            self._selection_changed(self.file_table.get_selected_files())
+        for index in (0, 1, 3):
+            self.file_menu.entryconfigure(index, state='disabled' if busy else 'normal')
 
     def _set_status(self, text):
-        self.status_label.config(text=text)
+        self._status_text = text
+        if not self._busy:
+            self.activity.heading.configure(text='Ready to work', style='secondary.Card.TLabel')
+            self.activity.detail.configure(text=text)
 
     def _repo_path(self):
         return self.config.get('local_path', '')
 
     def _assert_repo(self):
+        if self._busy:
+            return None
         repo_path = self._repo_path()
         if not self._is_repo_path(repo_path):
             show_error('No Repository',
@@ -232,12 +334,52 @@ class App:
         return repo_path
 
     def _initial_pull(self):
+        if self._busy or self.root.grab_current():
+            self.root.after(200, self._initial_pull)
+            return
         repo_path = self._repo_path()
         if self._is_repo_path(repo_path):
             self._on_pull()
 
     def _on_refresh(self):
         self._refresh()
+
+    def _on_open_file(self):
+        self._open_selected_path()
+
+    def _on_open_folder(self):
+        self._open_selected_path(containing_folder=True)
+
+    def _open_selected_path(self, containing_folder=False):
+        repo_path = self._assert_repo()
+        if not repo_path:
+            return
+        selected = self.file_table.get_selected_files()
+        if len(selected) != 1:
+            show_error('Select One File', 'Please select exactly one file to open.', parent=self.root)
+            return
+
+        path = os.path.abspath(os.path.join(repo_path, selected[0]['path']))
+        if containing_folder:
+            path = os.path.dirname(path)
+        exists = os.path.isdir(path) if containing_folder else os.path.isfile(path)
+        if not exists:
+            show_error('Cannot Open', 'The {} no longer exists:\n\n{}'.format(
+                'folder' if containing_folder else 'file', path), parent=self.root)
+            return
+        if not containing_folder and not selected[0]['status'].startswith('locked_by_me'):
+            if not show_confirm(
+                'Open Read-Only File?',
+                'This file is not locked by you and will be read-only.\n\n'
+                '{}\n\nDo you want to continue?'.format(selected[0]['path']),
+                parent=self.root,
+            ):
+                return
+        try:
+            os.startfile(path)
+        except OSError as exc:
+            show_error('Cannot Open', 'Windows could not open:\n\n{}\n\n{}'.format(path, exc),
+                       parent=self.root)
 
     def _refresh(self):
         repo_path = self._assert_repo()
@@ -249,14 +391,14 @@ class App:
             return get_file_statuses(repo_path)
 
         def on_done(statuses):
-            self.file_table.populate(statuses)
+            self._populate(statuses)
             total = len(statuses)
             locked = sum(1 for s in statuses if 'locked' in s['status'])
             modified = sum(1 for s in statuses if 'modified' in s['status'])
             deleted = sum(1 for s in statuses if s['status'] == 'deleted')
             file_new = sum(1 for s in statuses if s['status'] == 'new')
             conflicted = sum(1 for s in statuses if s['status'] == 'conflicted')
-            ready = total - locked - modified - deleted - file_new - conflicted
+            ready = sum(f['status'] == 'unchanged' and f.get('locks_verified', True) for f in statuses)
             parts = ['{} files'.format(total), '{} ready'.format(ready)]
             if modified:
                 parts.append('{} modified'.format(modified))
@@ -268,10 +410,11 @@ class App:
                 parts.append('{} conflicted'.format(conflicted))
             if locked:
                 parts.append('{} locked'.format(locked))
+            if any(not f.get('locks_verified', True) for f in statuses):
+                parts.append('lock ownership unavailable')
             self._set_status(' \u2014 '.join(parts))
-            self._update_title()
 
-        self._async(do_refresh, on_done=on_done)
+        self._async(do_refresh, on_done=on_done, title='Refreshing files')
 
     def _on_pull(self):
         repo_path = self._assert_repo()
@@ -279,17 +422,15 @@ class App:
             return
 
         def do_pull():
-            self._enqueue(lambda: self._set_status('Pulling latest changes...'))
             install_lfs(repo_path)
             pull_repo(repo_path)
             return get_file_statuses(repo_path)
 
         def on_done(statuses):
-            self.file_table.populate(statuses)
+            self._populate(statuses)
             self._set_status('Pull complete.')
-            self._update_title()
 
-        self._async(do_pull, on_done=on_done)
+        self._async(do_pull, on_done=on_done, title='Pulling latest changes')
 
     def _on_lock(self):
         repo_path = self._assert_repo()
@@ -329,10 +470,10 @@ class App:
             return get_file_statuses(repo_path)
 
         def on_done(statuses):
-            self.file_table.populate(statuses)
+            self._populate(statuses)
             self._set_status('Locked {} file(s).'.format(len(paths)))
 
-        self._async(do_lock, on_done=on_done)
+        self._async(do_lock, on_done=on_done, title='Locking files')
 
     def _on_unlock(self):
         repo_path = self._assert_repo()
@@ -380,10 +521,10 @@ class App:
             return get_file_statuses(repo_path)
 
         def on_done(statuses):
-            self.file_table.populate(statuses)
+            self._populate(statuses)
             self._set_status('Unlocked {} file(s).'.format(len(paths)))
 
-        self._async(do_unlock, on_done=on_done)
+        self._async(do_unlock, on_done=on_done, title='Unlocking files')
 
     def _on_commit_push(self):
         repo_path = self._assert_repo()
@@ -412,21 +553,19 @@ class App:
         deleted_paths = [f['path'] for f in to_commit if f['status'] == 'deleted']
 
         def do_commit():
-            self._enqueue(lambda: self._set_status('Pulling latest changes...'))
             install_lfs(repo_path)
             pull_repo(repo_path)
-            self._enqueue(lambda: self._set_status('Committing and pushing...'))
-            commit_and_push(repo_path, paths, msg, deleted_paths=deleted_paths)
+            commit_and_push(repo_path, paths, msg, deleted_paths=deleted_paths,
+                            unlock_paths=[f['path'] for f in to_commit if f['status'].startswith('locked_by_me')])
             return get_file_statuses(repo_path)
 
         def on_done(statuses):
-            self.file_table.populate(statuses)
+            self._populate(statuses)
             self._set_status(
                 'Committed and pushed {} file(s).'.format(len(paths))
             )
-            self._update_title()
 
-        self._async(do_commit, on_done=on_done)
+        self._async(do_commit, on_done=on_done, title='Saving and pushing changes')
 
     def _on_restore(self):
         repo_path = self._assert_repo()
@@ -458,27 +597,15 @@ class App:
             return get_file_statuses(repo_path)
 
         def on_done(statuses):
-            self.file_table.populate(statuses)
+            self._populate(statuses)
             self._set_status('Restored {} file(s).'.format(len(paths)))
-            self._update_title()
 
-        self._async(do_restore, on_done=on_done)
+        self._async(do_restore, on_done=on_done, title='Restoring files')
 
     def _on_hard_reset(self):
         repo_path = self._assert_repo()
         if not repo_path:
             return
-
-        try:
-            branch = get_current_branch(repo_path)
-            if branch == 'HEAD':
-                show_error('Cannot Reset',
-                    'The repository is in a detached HEAD state.\n'
-                    'Open File > Settings and set the correct branch,\n'
-                    'then try again.')
-                return
-        except GitError:
-            pass
 
         if not show_confirm(
             'Hard Reset',
@@ -489,18 +616,18 @@ class App:
             return
 
         def do_reset():
-            self._enqueue(lambda: self._set_status('Hard resetting to origin...'))
             hard_reset_repo(repo_path)
             return get_file_statuses(repo_path)
 
         def on_done(statuses):
-            self.file_table.populate(statuses)
+            self._populate(statuses)
             self._set_status('Hard reset complete.')
-            self._update_title()
 
-        self._async(do_reset, on_done=on_done)
+        self._async(do_reset, on_done=on_done, title='Resetting repository')
 
     def _show_settings(self):
+        if self._busy:
+            return
         dlg = tb.Toplevel(self.root)
         dlg.title('Settings')
         dlg.resizable(False, False)
@@ -546,25 +673,29 @@ class App:
                     parent=dlg)
                 return
 
-            if new_branch and new_path:
-                try:
-                    current_branch = get_current_branch(new_path)
-                    if new_branch != current_branch:
-                        checkout_branch(new_path, new_branch)
-                except GitError as e:
-                    if not show_confirm('Branch Checkout Failed',
-                        'Could not switch to branch "{}".\n\n'
-                        '{}\n\nSave anyway?'.format(new_branch, str(e)),
-                        parent=dlg
-                    ):
-                        return
+            settings = dict(self.config, repo_url=url_var.get().strip(),
+                            local_path=new_path, branch=new_branch)
+            if not self._is_repo_path(new_path):
+                show_error('Invalid Path', 'Choose an existing Git repository.', parent=dlg)
+                return
 
-            self.config['repo_url'] = url_var.get().strip()
-            self.config['local_path'] = new_path
-            self.config['branch'] = new_branch
-            save_config(self.config)
+            def apply_settings():
+                if new_branch and new_branch != get_current_branch(new_path):
+                    checkout_branch(new_path, new_branch)
+                save_config(settings)
+                report('Settings saved. Refreshing the selected repository…')
+                return settings
+
+            def done(settings):
+                self.config = settings
+                self.repo_label.configure(text=new_path)
+                self.branch_label.configure(text='Loading repository…')
+                self._populate([])
+                self._set_status('Repository settings saved.')
+                self.root.after(100, self._refresh)
+
             dlg.destroy()
-            self._refresh()
+            self._async(apply_settings, on_done=done, title='Applying repository settings')
 
         bf = ttk.Frame(frame)
         bf.grid(row=3, column=0, columnspan=2, pady=(s(15), 0))
@@ -581,11 +712,21 @@ class App:
         return os.path.join(base, rel)
 
     def _set_app_icon(self):
+        if sys.platform == 'win32':
+            try:
+                # Windows selects the appropriate size for the title bar,
+                # taskbar, Alt+Tab, and any subsequently created dialogs.
+                self.root.iconbitmap(default=self._resource_path(
+                    os.path.join('resources', 'icon.ico')))
+                return
+            except tk.TclError:
+                pass
         try:
-            img = tk.PhotoImage(file=self._resource_path(os.path.join('resources', 'icon.png')))
+            img = tk.PhotoImage(master=self.root, file=self._resource_path(
+                os.path.join('resources', 'icon.png')))
             self.root.iconphoto(True, img)
             self._icon_img = img
-        except Exception:
+        except tk.TclError:
             pass
 
     def _show_about(self):
